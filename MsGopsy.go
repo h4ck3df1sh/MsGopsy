@@ -291,7 +291,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  --jitter-ms N             Add random 0..N ms jitter to each delay")
 		fmt.Fprintln(os.Stderr, "  --user-agent UA           Set a custom User-Agent header")
 		fmt.Fprintln(os.Stderr, "  --user-agent-random       Use a random common User-Agent each request")
-		fmt.Fprintln(os.Stderr, "  --x-forwarded-for IP      Set X-Forwarded-For header (default for FireProx is 127.0.0.1)")
+		fmt.Fprintln(os.Stderr, "  --x-forwarded-for         Set X-Forwarded-For header as 127.0.0.1 (Used for FireProx)")
 		fmt.Fprintln(os.Stderr, "  -h, --help                Show this help menu")
 	}
 
@@ -313,7 +313,7 @@ func main() {
 	jitterMs := flag.Int("jitter-ms", 0, "Random jitter 0..N ms added to delay")
 	userAgent := flag.String("user-agent", "", "Custom User-Agent header")
 	userAgentRandom := flag.Bool("user-agent-random", false, "Use random common User-Agent each request")
-	xfwdHeader := flag.Bool("x-forwarded-for", false, "X-Forwarded-For header value (Used as 127.0.0.1 for FireProx)")
+	xfwdHeader := flag.Bool("x-forwarded-for", false, "Set X-Forwarded-For header as 127.0.0.1 (Used for FireProx)")
 	// Support long flags
 	flag.StringVar(username, "username", "", "Single username (user@domain.com)")
 	flag.StringVar(usernameList, "username-list", "", "File with usernames, one per line")
