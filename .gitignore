@@ -1,0 +1,5 @@
+*.exe
+*.log
+bin/
+dist/
+builds/
